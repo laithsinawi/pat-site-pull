@@ -54,13 +54,21 @@ REMOTE_SSH_TARGET=""
 usage() {
   cat <<EOF
 Usage:
-  $SCRIPT_NAME [all|files|db|check] [options]
+  $SCRIPT_NAME [all|files|db|check|help] [options]
+
+Quick Commands:
+  $SCRIPT_NAME help
+  $SCRIPT_NAME check
+  $SCRIPT_NAME files --skip-uploads
+  $SCRIPT_NAME db
+  $SCRIPT_NAME all
 
 Commands:
   all            Sync files, then pull and rewrite the database. Default.
   files          Sync site files only.
   db             Pull and rewrite the database only.
   check          Validate Local and remote configuration without changing data.
+  help           Show this help output.
 
 Options:
   -n, --dry-run          Show what would run without making changes.
@@ -91,6 +99,7 @@ Environment overrides:
   PAT_LOCAL_STATUSES_JSON
 
 Examples:
+  $SCRIPT_NAME help
   $SCRIPT_NAME check
   $SCRIPT_NAME files --skip-uploads
   $SCRIPT_NAME db
@@ -147,7 +156,7 @@ acquire_lock() {
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      all|files|db|check)
+      all|files|db|check|help)
         COMMAND="$1"
         shift
         ;;
@@ -538,6 +547,10 @@ main() {
   acquire_lock
 
   case "$COMMAND" in
+    help)
+      usage
+      exit 0
+      ;;
     check)
       check_remote_wordpress
       require_local_database
