@@ -1,0 +1,570 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_NAME="$(basename "$0")"
+
+DEFAULT_LOCAL_SITE_NAME="priceactiontools"
+DEFAULT_LOCAL_PUBLIC_PATH="/Users/laithsinawi/Local Sites/priceactiontools/app/public"
+DEFAULT_LOCAL_URL="http://priceactiontools.local"
+DEFAULT_REMOTE_URL="https://priceactiontools.com"
+DEFAULT_REMOTE_PATH="/home/u2659-glurhymrg9jb/www/priceactiontools.com/public_html"
+DEFAULT_REMOTE_SSH_USER="u2659-glurhymrg9jb"
+DEFAULT_REMOTE_SSH_HOST="gcam1030.siteground.biz"
+DEFAULT_REMOTE_SSH_PORT="18765"
+DEFAULT_LOCAL_RESOURCES="/Applications/Local.app/Contents/Resources/extraResources"
+DEFAULT_LOCAL_SITES_JSON="$HOME/Library/Application Support/Local/sites.json"
+DEFAULT_LOCAL_STATUSES_JSON="$HOME/Library/Application Support/Local/site-statuses.json"
+
+COMMAND="all"
+DRY_RUN=0
+SKIP_UPLOADS=0
+NO_BACKUP=0
+KEEP_DUMP=0
+
+LOCAL_SITE_NAME="${PAT_LOCAL_SITE_NAME:-$DEFAULT_LOCAL_SITE_NAME}"
+LOCAL_PUBLIC_PATH="${PAT_LOCAL_PUBLIC_PATH:-$DEFAULT_LOCAL_PUBLIC_PATH}"
+LOCAL_URL="${PAT_LOCAL_URL:-$DEFAULT_LOCAL_URL}"
+REMOTE_URL="${PAT_REMOTE_URL:-$DEFAULT_REMOTE_URL}"
+REMOTE_PATH="${PAT_REMOTE_PATH:-$DEFAULT_REMOTE_PATH}"
+REMOTE_SSH_USER="${PAT_REMOTE_SSH_USER:-$DEFAULT_REMOTE_SSH_USER}"
+REMOTE_SSH_HOST="${PAT_REMOTE_SSH_HOST:-$DEFAULT_REMOTE_SSH_HOST}"
+REMOTE_SSH_PORT="${PAT_REMOTE_SSH_PORT:-$DEFAULT_REMOTE_SSH_PORT}"
+LOCAL_RESOURCES="${PAT_LOCAL_RESOURCES:-$DEFAULT_LOCAL_RESOURCES}"
+LOCAL_SITES_JSON="${PAT_LOCAL_SITES_JSON:-$DEFAULT_LOCAL_SITES_JSON}"
+LOCAL_STATUSES_JSON="${PAT_LOCAL_STATUSES_JSON:-$DEFAULT_LOCAL_STATUSES_JSON}"
+
+LOCK_DIR=""
+LOCAL_PLATFORM=""
+LOCAL_SITE_ROOT=""
+LOCAL_SITE_ID=""
+LOCAL_SITE_DOMAIN=""
+LOCAL_SITE_STATUS="unknown"
+LOCAL_PHP_VERSION=""
+LOCAL_MYSQL_VERSION=""
+LOCAL_RUN_DIR=""
+LOCAL_PHP_INI=""
+LOCAL_MY_CNF_DIR=""
+LOCAL_PHP_BIN=""
+LOCAL_MYSQL_BIN_DIR=""
+LOCAL_WP_PHAR=""
+LOCAL_WP_CONFIG=""
+REMOTE_SSH_TARGET=""
+
+usage() {
+  cat <<EOF
+Usage:
+  $SCRIPT_NAME [all|files|db|check] [options]
+
+Commands:
+  all            Sync files, then pull and rewrite the database. Default.
+  files          Sync site files only.
+  db             Pull and rewrite the database only.
+  check          Validate Local and remote configuration without changing data.
+
+Options:
+  -n, --dry-run          Show what would run without making changes.
+  --skip-uploads         Skip syncing wp-content/uploads.
+  --no-backup            Skip the local database backup before import.
+  --keep-dump            Keep the downloaded SQL dump in /tmp after import.
+  --local-path PATH      Override the Local site's public path.
+  --local-url URL        Override the Local site's WordPress URL.
+  --site-name NAME       Override the Local site name used in sites.json lookup.
+  --remote-url URL       Override the production WordPress URL.
+  --remote-path PATH     Override the remote WordPress document root.
+  --ssh-user USER        Override the SSH user.
+  --ssh-host HOST        Override the SSH host.
+  --ssh-port PORT        Override the SSH port.
+  -h, --help             Show this help.
+
+Environment overrides:
+  PAT_LOCAL_SITE_NAME
+  PAT_LOCAL_PUBLIC_PATH
+  PAT_LOCAL_URL
+  PAT_REMOTE_URL
+  PAT_REMOTE_PATH
+  PAT_REMOTE_SSH_USER
+  PAT_REMOTE_SSH_HOST
+  PAT_REMOTE_SSH_PORT
+  PAT_LOCAL_RESOURCES
+  PAT_LOCAL_SITES_JSON
+  PAT_LOCAL_STATUSES_JSON
+
+Examples:
+  $SCRIPT_NAME check
+  $SCRIPT_NAME files --skip-uploads
+  $SCRIPT_NAME db
+  $SCRIPT_NAME all --dry-run
+EOF
+}
+
+log() {
+  printf '[%s] %s\n' "$1" "$2"
+}
+
+info() {
+  log INFO "$1"
+}
+
+warn() {
+  log WARN "$1" >&2
+}
+
+die() {
+  log ERROR "$1" >&2
+  exit 1
+}
+
+expand_path() {
+  local raw="$1"
+  if [[ "$raw" == "~"* ]]; then
+    printf '%s\n' "${raw/#\~/$HOME}"
+    return
+  fi
+
+  printf '%s\n' "$raw"
+}
+
+command_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+cleanup() {
+  if [[ -n "$LOCK_DIR" && -d "$LOCK_DIR" ]]; then
+    rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
+  fi
+}
+
+acquire_lock() {
+  LOCK_DIR="${TMPDIR:-/tmp}/pat-site-pull.lock"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    die "Another $SCRIPT_NAME process appears to be running."
+  fi
+
+  trap cleanup EXIT
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      all|files|db|check)
+        COMMAND="$1"
+        shift
+        ;;
+      -n|--dry-run)
+        DRY_RUN=1
+        shift
+        ;;
+      --skip-uploads)
+        SKIP_UPLOADS=1
+        shift
+        ;;
+      --no-backup)
+        NO_BACKUP=1
+        shift
+        ;;
+      --keep-dump)
+        KEEP_DUMP=1
+        shift
+        ;;
+      --local-path)
+        [[ $# -ge 2 ]] || die "--local-path requires a value."
+        LOCAL_PUBLIC_PATH="$2"
+        shift 2
+        ;;
+      --local-url)
+        [[ $# -ge 2 ]] || die "--local-url requires a value."
+        LOCAL_URL="$2"
+        shift 2
+        ;;
+      --site-name)
+        [[ $# -ge 2 ]] || die "--site-name requires a value."
+        LOCAL_SITE_NAME="$2"
+        shift 2
+        ;;
+      --remote-url)
+        [[ $# -ge 2 ]] || die "--remote-url requires a value."
+        REMOTE_URL="$2"
+        shift 2
+        ;;
+      --remote-path)
+        [[ $# -ge 2 ]] || die "--remote-path requires a value."
+        REMOTE_PATH="$2"
+        shift 2
+        ;;
+      --ssh-user)
+        [[ $# -ge 2 ]] || die "--ssh-user requires a value."
+        REMOTE_SSH_USER="$2"
+        shift 2
+        ;;
+      --ssh-host)
+        [[ $# -ge 2 ]] || die "--ssh-host requires a value."
+        REMOTE_SSH_HOST="$2"
+        shift 2
+        ;;
+      --ssh-port)
+        [[ $# -ge 2 ]] || die "--ssh-port requires a value."
+        REMOTE_SSH_PORT="$2"
+        shift 2
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+resolve_local_site_context() {
+  LOCAL_PUBLIC_PATH="$(expand_path "$LOCAL_PUBLIC_PATH")"
+  LOCAL_SITES_JSON="$(expand_path "$LOCAL_SITES_JSON")"
+  LOCAL_STATUSES_JSON="$(expand_path "$LOCAL_STATUSES_JSON")"
+  LOCAL_RESOURCES="$(expand_path "$LOCAL_RESOURCES")"
+
+  [[ -d "$LOCAL_PUBLIC_PATH" ]] || die "Local public path not found: $LOCAL_PUBLIC_PATH"
+  [[ -f "$LOCAL_PUBLIC_PATH/wp-config.php" ]] || die "wp-config.php not found in $LOCAL_PUBLIC_PATH"
+  [[ -f "$LOCAL_SITES_JSON" ]] || die "Local sites.json not found: $LOCAL_SITES_JSON"
+  [[ -x /usr/bin/python3 ]] || die "This script expects /usr/bin/python3 for Local metadata lookup."
+
+  local site_data
+  site_data="$(
+    LOCAL_PUBLIC_PATH="$LOCAL_PUBLIC_PATH" \
+    LOCAL_SITE_NAME="$LOCAL_SITE_NAME" \
+    LOCAL_SITES_JSON="$LOCAL_SITES_JSON" \
+    /usr/bin/python3 <<'PY'
+import json
+import os
+import sys
+
+public_path = os.path.realpath(os.path.expanduser(os.environ["LOCAL_PUBLIC_PATH"]))
+target_root = os.path.realpath(os.path.join(public_path, "..", ".."))
+target_name = os.environ["LOCAL_SITE_NAME"]
+sites_json = os.path.realpath(os.path.expanduser(os.environ["LOCAL_SITES_JSON"]))
+
+with open(sites_json, "r", encoding="utf-8") as handle:
+    sites = json.load(handle)
+
+matches = []
+for site_id, site in sites.items():
+    site_root = os.path.realpath(os.path.expanduser(site.get("path", "")))
+    site_name = site.get("name", "")
+    services = site.get("services", {})
+    php_version = services.get("php", {}).get("version", "")
+    mysql_version = services.get("mysql", {}).get("version", "")
+    domain = site.get("domain", "")
+
+    if site_root == target_root or site_name == target_name:
+        matches.append(
+            (
+                site_id,
+                site_name,
+                domain,
+                php_version,
+                mysql_version,
+                site_root,
+            )
+        )
+
+if not matches:
+    sys.exit(1)
+
+site_id, site_name, domain, php_version, mysql_version, site_root = matches[0]
+print("\t".join([site_id, site_name, domain, php_version, mysql_version, site_root]))
+PY
+  )" || die "Could not resolve the Local site from sites.json."
+
+  IFS=$'\t' read -r LOCAL_SITE_ID LOCAL_SITE_NAME LOCAL_SITE_DOMAIN LOCAL_PHP_VERSION LOCAL_MYSQL_VERSION LOCAL_SITE_ROOT <<<"$site_data"
+
+  [[ -n "$LOCAL_SITE_ID" ]] || die "Resolved Local site ID is empty."
+  [[ -n "$LOCAL_PHP_VERSION" ]] || die "Resolved Local PHP version is empty."
+  [[ -n "$LOCAL_MYSQL_VERSION" ]] || die "Resolved Local MySQL version is empty."
+
+  if [[ -z "${PAT_LOCAL_URL:-}" && "$LOCAL_URL" == "$DEFAULT_LOCAL_URL" && -n "$LOCAL_SITE_DOMAIN" ]]; then
+    LOCAL_URL="http://$LOCAL_SITE_DOMAIN"
+  fi
+}
+
+resolve_local_status() {
+  if [[ -f "$LOCAL_STATUSES_JSON" ]]; then
+    LOCAL_SITE_STATUS="$(
+      LOCAL_SITE_ID="$LOCAL_SITE_ID" \
+      LOCAL_STATUSES_JSON="$LOCAL_STATUSES_JSON" \
+      /usr/bin/python3 <<'PY'
+import json
+import os
+
+site_id = os.environ["LOCAL_SITE_ID"]
+statuses_json = os.path.realpath(os.path.expanduser(os.environ["LOCAL_STATUSES_JSON"]))
+
+with open(statuses_json, "r", encoding="utf-8") as handle:
+    statuses = json.load(handle)
+
+print(statuses.get(site_id, "unknown"))
+PY
+    )"
+  fi
+}
+
+first_match() {
+  local pattern="$1"
+  local matches=()
+
+  shopt -s nullglob
+  matches=($pattern)
+  shopt -u nullglob
+
+  [[ ${#matches[@]} -gt 0 ]] || return 1
+  printf '%s\n' "${matches[0]}"
+}
+
+resolve_local_binaries() {
+  case "$(uname -m)" in
+    arm64|aarch64)
+      LOCAL_PLATFORM="darwin-arm64"
+      ;;
+    x86_64)
+      LOCAL_PLATFORM="darwin"
+      ;;
+    *)
+      die "Unsupported macOS architecture: $(uname -m)"
+      ;;
+  esac
+
+  LOCAL_RUN_DIR="$HOME/Library/Application Support/Local/run/$LOCAL_SITE_ID"
+  LOCAL_PHP_INI="$LOCAL_RUN_DIR/conf/php/php.ini"
+  LOCAL_MY_CNF_DIR="$LOCAL_RUN_DIR/conf/mysql"
+  LOCAL_WP_PHAR="$LOCAL_RESOURCES/bin/wp-cli/wp-cli.phar"
+  LOCAL_WP_CONFIG="$LOCAL_RESOURCES/bin/wp-cli/config.yaml"
+
+  local php_match mysql_match
+  php_match="$(first_match "$LOCAL_RESOURCES/lightning-services/php-$LOCAL_PHP_VERSION+*/bin/$LOCAL_PLATFORM/bin/php")" || die "Could not locate Local PHP $LOCAL_PHP_VERSION in $LOCAL_RESOURCES."
+  mysql_match="$(first_match "$LOCAL_RESOURCES/lightning-services/mysql-$LOCAL_MYSQL_VERSION+*/bin/$LOCAL_PLATFORM/bin/mysql")" || die "Could not locate Local MySQL $LOCAL_MYSQL_VERSION in $LOCAL_RESOURCES."
+
+  LOCAL_PHP_BIN="$php_match"
+  LOCAL_MYSQL_BIN_DIR="$(dirname "$mysql_match")"
+
+  [[ -f "$LOCAL_PHP_INI" ]] || die "Local PHP config not found: $LOCAL_PHP_INI"
+  [[ -f "$LOCAL_MY_CNF_DIR/my.cnf" ]] || die "Local MySQL config not found: $LOCAL_MY_CNF_DIR/my.cnf. Start the site in Local first."
+  [[ -f "$LOCAL_WP_PHAR" ]] || die "Local WP-CLI phar not found: $LOCAL_WP_PHAR"
+  [[ -f "$LOCAL_WP_CONFIG" ]] || die "Local WP-CLI config not found: $LOCAL_WP_CONFIG"
+}
+
+preflight() {
+  command_exists ssh || die "ssh is required."
+  command_exists rsync || die "rsync is required."
+
+  resolve_local_site_context
+  resolve_local_status
+  resolve_local_binaries
+
+  REMOTE_SSH_TARGET="$REMOTE_SSH_USER@$REMOTE_SSH_HOST"
+}
+
+local_wp() {
+  env \
+    PATH="$LOCAL_MYSQL_BIN_DIR:$(dirname "$LOCAL_PHP_BIN"):$PATH" \
+    MYSQL_HOME="$LOCAL_MY_CNF_DIR" \
+    WP_CLI_CONFIG_PATH="$LOCAL_WP_CONFIG" \
+    "$LOCAL_PHP_BIN" -c "$LOCAL_PHP_INI" "$LOCAL_WP_PHAR" --path="$LOCAL_PUBLIC_PATH" "$@"
+}
+
+remote_ssh() {
+  ssh -p "$REMOTE_SSH_PORT" "$REMOTE_SSH_TARGET" "$@"
+}
+
+require_local_database() {
+  if [[ "$LOCAL_SITE_STATUS" != "running" ]]; then
+    die "Local site '$LOCAL_SITE_NAME' is '$LOCAL_SITE_STATUS'. Start it in Local before running '$COMMAND'."
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return
+  fi
+
+  local_wp --skip-plugins --skip-themes db check >/dev/null
+}
+
+check_remote_wordpress() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "Dry run: would verify remote WordPress at $REMOTE_SSH_TARGET:$REMOTE_PATH"
+    return
+  fi
+
+  remote_ssh test -d "$REMOTE_PATH/wp-content" || die "Remote WordPress path is not accessible: $REMOTE_PATH"
+}
+
+print_summary() {
+  cat <<EOF
+Resolved configuration
+  command:           $COMMAND
+  local site name:   $LOCAL_SITE_NAME
+  local site id:     $LOCAL_SITE_ID
+  local status:      $LOCAL_SITE_STATUS
+  local public path: $LOCAL_PUBLIC_PATH
+  local url:         $LOCAL_URL
+  local php:         $LOCAL_PHP_BIN
+  local mysql bin:   $LOCAL_MYSQL_BIN_DIR
+  remote target:     $REMOTE_SSH_TARGET:$REMOTE_PATH
+  remote url:        $REMOTE_URL
+  skip uploads:      $SKIP_UPLOADS
+  dry run:           $DRY_RUN
+EOF
+}
+
+run_check() {
+  print_summary
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    info "Dry run complete."
+    return
+  fi
+
+  local remote_home local_home
+  remote_home="$(remote_ssh wp --path="$REMOTE_PATH" option get home --skip-plugins --skip-themes)"
+  local_home="$(local_wp --skip-plugins --skip-themes option get home)"
+
+  printf '\nChecks\n'
+  printf '  remote home: %s\n' "$remote_home"
+  printf '  local home:  %s\n' "$local_home"
+
+  local_wp --skip-plugins --skip-themes db check >/dev/null
+  printf '  local db:    ok\n'
+}
+
+run_files_sync() {
+  info "Syncing files from $REMOTE_SSH_TARGET:$REMOTE_PATH to $LOCAL_PUBLIC_PATH"
+
+  local rsync_cmd=(
+    rsync
+    --archive
+    --compress
+    --delete
+    --human-readable
+    --no-owner
+    --no-group
+    --no-perms
+    --itemize-changes
+    --exclude=.htaccess
+    --exclude=local-xdebuginfo.php
+    --exclude=php_errorlog
+    --exclude=wp-config.php
+    --exclude=wp-content/cache/
+    --exclude=wp-content/debug.log
+    --exclude=wp-content/upgrade/
+    --exclude=wp-content/wflogs/
+    -e
+    "ssh -p $REMOTE_SSH_PORT"
+  )
+
+  if [[ "$SKIP_UPLOADS" -eq 1 ]]; then
+    rsync_cmd+=(--exclude=wp-content/uploads/)
+  fi
+
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    rsync_cmd+=(--dry-run)
+  fi
+
+  rsync_cmd+=(
+    "$REMOTE_SSH_TARGET:$REMOTE_PATH/"
+    "$LOCAL_PUBLIC_PATH/"
+  )
+
+  "${rsync_cmd[@]}"
+}
+
+make_backup_dir() {
+  local backup_dir="$LOCAL_SITE_ROOT/app/sql/pat-pull-backups"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    mkdir -p "$backup_dir"
+  fi
+  printf '%s\n' "$backup_dir"
+}
+
+run_database_sync() {
+  require_local_database
+
+  local timestamp dump_file backup_file backup_dir remote_http_url
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    dump_file="$(mktemp "${TMPDIR:-/tmp}/pat-priceactiontools-${timestamp}-XXXXXX.sql")"
+  else
+    dump_file="${TMPDIR:-/tmp}/pat-priceactiontools-${timestamp}.sql"
+  fi
+  remote_http_url="${REMOTE_URL/https:\/\//http://}"
+
+  info "Exporting remote database to $dump_file"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    remote_ssh wp --path="$REMOTE_PATH" db export - --add-drop-table --single-transaction --quick --skip-lock-tables >"$dump_file"
+  fi
+
+  if [[ "$NO_BACKUP" -eq 0 ]]; then
+    backup_dir="$(make_backup_dir)"
+    backup_file="$backup_dir/pre-pull-$timestamp.sql"
+    info "Backing up the current local database to $backup_file"
+    if [[ "$DRY_RUN" -eq 0 ]]; then
+      local_wp --skip-plugins --skip-themes db export "$backup_file" --add-drop-table >/dev/null
+    fi
+  fi
+
+  info "Importing remote database into Local"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    local_wp --skip-plugins --skip-themes db import "$dump_file" >/dev/null
+  fi
+
+  info "Rewriting production URLs to $LOCAL_URL"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    local_wp --skip-plugins --skip-themes search-replace "$REMOTE_URL" "$LOCAL_URL" --all-tables-with-prefix --skip-columns=guid --precise --quiet
+    local_wp --skip-plugins --skip-themes search-replace "$remote_http_url" "$LOCAL_URL" --all-tables-with-prefix --skip-columns=guid --precise --quiet
+    local_wp --skip-plugins --skip-themes option update home "$LOCAL_URL" >/dev/null
+    local_wp --skip-plugins --skip-themes option update siteurl "$LOCAL_URL" >/dev/null
+    local_wp --skip-plugins --skip-themes cache flush >/dev/null || true
+  fi
+
+  if [[ "$DRY_RUN" -eq 0 && "$KEEP_DUMP" -eq 0 ]]; then
+    rm -f "$dump_file"
+  fi
+
+  if [[ "$DRY_RUN" -eq 0 && "$KEEP_DUMP" -eq 1 ]]; then
+    info "Kept downloaded SQL dump at $dump_file"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  preflight
+  acquire_lock
+
+  case "$COMMAND" in
+    check)
+      check_remote_wordpress
+      require_local_database
+      run_check
+      ;;
+    files)
+      check_remote_wordpress
+      print_summary
+      run_files_sync
+      ;;
+    db)
+      check_remote_wordpress
+      print_summary
+      run_database_sync
+      ;;
+    all)
+      check_remote_wordpress
+      print_summary
+      run_files_sync
+      run_database_sync
+      ;;
+    *)
+      die "Unsupported command: $COMMAND"
+      ;;
+  esac
+
+  info "Done."
+}
+
+main "$@"
